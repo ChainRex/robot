@@ -1,9 +1,11 @@
+use axum::extract::Extension;
 use axum::{
     extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
     response::Response,
     routing::get,
     serve, Router,
 };
+use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
@@ -104,8 +106,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Start the web server
     let app = Router::new()
+        .route("/ws", get(ws_handler))
         .nest_service("/", ServeDir::new("static"))
-        .route("/ws", get(move |ws| ws_handler(ws, broadcast_tx.clone())));
+        .layer(Extension(socket.clone()))
+        .layer(Extension(clients.clone()));
 
     let log_tx_clone = log_tx.clone();
     println!("Web服务器已启动，访问 http://localhost:3000");
@@ -350,17 +354,35 @@ fn current_timestamp() -> u64 {
 // Add this new function for handling WebSocket connections
 async fn ws_handler(
     ws: WebSocketUpgrade,
-    broadcast_tx: Arc<broadcast::Sender<String>>,
+    socket: Extension<Arc<UdpSocket>>,
+    clients: Extension<Arc<Mutex<ClientManager>>>,
 ) -> Response {
-    ws.on_upgrade(move |socket| handle_socket(socket, broadcast_tx))
-}
+    let socket = socket.0;
+    let clients = clients.0;
 
-async fn handle_socket(mut socket: WebSocket, broadcast_tx: Arc<broadcast::Sender<String>>) {
-    let mut rx = broadcast_tx.subscribe();
+    ws.on_upgrade(move |websocket| async move {
+        println!("WebSocket 客户端已连接");
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+        let (mut sender, mut receiver) = websocket.split();
 
-    while let Ok(msg) = rx.recv().await {
-        if socket.send(WsMessage::Text(msg)).await.is_err() {
-            break;
+        while let Some(msg) = receiver.next().await {
+            if let Ok(msg) = msg {
+                match msg {
+                    WsMessage::Text(text) => {
+                        if let Ok(udp_msg) = serde_json::from_str(&text) {
+                            handle_message(udp_msg, addr, &socket, &clients).await;
+                        }
+                    }
+                    WsMessage::Binary(_) => {
+                        // 处理二进制消息如果需要
+                    }
+                    WsMessage::Close(_) => {
+                        break;
+                    }
+                    _ => {}
+                }
+            }
         }
-    }
+        println!("WebSocket 客户端已断开");
+    })
 }

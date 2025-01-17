@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>机器人控制端</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <div class="left-panel">
+            <div class="connection-panel">
+                <h3>连接设置</h3>
+                <div class="form-group">
+                    <label for="server-ip">服务器地址:</label>
+                    <input type="text" id="server-ip" value="127.0.0.1" />
+                </div>
+                <div class="form-group">
+                    <label for="client-id">客户端ID:</label>
+                    <input type="text" id="client-id" value="control_1" />
+                </div>
+                <button id="connect-btn">连接</button>
+                <div id="connection-status" class="status">未连接</div>
+            </div>
+            
+            <div class="control-panel">
+                <h3>控制面板</h3>
+                <div class="control-buttons">
+                    <button id="forward-btn" class="control-btn" disabled>前进</button>
+                    <button id="backward-btn" class="control-btn" disabled>后退</button>
+                    <button id="left-btn" class="control-btn" disabled>左转</button>
+                    <button id="right-btn" class="control-btn" disabled>右转</button>
+                </div>
+            </div>
+        </div>
+        
+        <div class="right-panel">
+            <div class="video-panel">
+                <h3>视频画面</h3>
+                <div id="video-container">
+                    <img id="video-feed" src="" alt="等待视频流..." />
+                </div>
+            </div>
+        </div>
+    </div>
+    <script src="udp.js"></script>
+    <script src="app.js"></script>
+</body>
+</html> 
