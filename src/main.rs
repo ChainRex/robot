@@ -1,6 +1,6 @@
 use axum::extract::Extension;
 use axum::{
-    extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
+    extract::ws::{Message as WsMessage, WebSocketUpgrade},
     response::Response,
     routing::get,
     serve, Router,
@@ -103,26 +103,32 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut client_manager = ClientManager::new();
     client_manager.broadcast_tx = Some(broadcast_tx.clone());
     let clients = Arc::new(Mutex::new(client_manager));
-
-    // Start the web server
-    let app = Router::new()
-        .route("/ws", get(ws_handler))
-        .nest_service("/", ServeDir::new("static"))
-        .layer(Extension(socket.clone()))
-        .layer(Extension(clients.clone()));
-
-    let log_tx_clone = log_tx.clone();
-    println!("Web服务器已启动，访问 http://localhost:3000");
-
-    // Start the web server
-    tokio::spawn(async move {
-        let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-        serve(listener, app).await.unwrap();
-    });
-
-    // 复制 Arc<UdpSocket> 而不是直接复制 UdpSocket
+    let clients_for_web = clients.clone(); // 用于 web server
+    let clients_for_monitor = clients.clone(); // 用于监控
+    let clients_for_cleanup = clients.clone(); // 用于清理任务
     let socket_clone = Arc::clone(&socket);
-    let clients_clone = clients.clone();
+    let clients_clone = clients_for_monitor.clone();
+
+    // Start the web server
+    let socket_for_web = socket.clone();
+    tokio::spawn(async move {
+        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], 3000));
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        println!("Web服务器已启动，访问 http://localhost:3000");
+
+        let app = Router::new()
+            .route("/ws", get(ws_handler))
+            .nest_service("/", ServeDir::new("static"))
+            .layer(Extension(socket_for_web))
+            .layer(Extension(clients.clone()));
+
+        serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
 
     // 启动一个任务来接收和处理消息
     tokio::spawn(async move {
@@ -149,12 +155,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     });
 
     // 启动一个任务来监控心跳并清理失效的客户端
-    let clients_clone = clients.clone();
     tokio::spawn(async move {
         let mut interval = time::interval(Duration::from_secs(30));
         loop {
             interval.tick().await;
-            let mut clients = clients_clone.lock().await;
+            let mut clients = clients_for_cleanup.lock().await;
             clients.cleanup();
         }
     });
@@ -356,33 +361,59 @@ async fn ws_handler(
     ws: WebSocketUpgrade,
     socket: Extension<Arc<UdpSocket>>,
     clients: Extension<Arc<Mutex<ClientManager>>>,
+    connecting: axum::extract::ConnectInfo<std::net::SocketAddr>,
 ) -> Response {
-    let socket = socket.0;
+    let socket = socket.0.clone();
+    let socket_clone = socket.clone();
     let clients = clients.0;
+    let clients_clone = clients.clone();
+    let clients_for_rx = clients.clone();
 
     ws.on_upgrade(move |websocket| async move {
-        println!("WebSocket 客户端已连接");
-        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+        println!("WebSocket 客户端已连接，IP: {}", connecting.0);
+        let addr = connecting.0;
         let (mut sender, mut receiver) = websocket.split();
 
-        while let Some(msg) = receiver.next().await {
-            if let Ok(msg) = msg {
+        // Subscribe to broadcast channel
+        let mut rx = {
+            let clients = clients_for_rx.lock().await;
+            if let Some(tx) = &clients.broadcast_tx {
+                tx.subscribe()
+            } else {
+                return;
+            }
+        };
+
+        // Handle incoming messages from broadcast channel
+        let mut send_task = tokio::spawn(async move {
+            while let Ok(msg) = rx.recv().await {
+                if sender.send(WsMessage::Text(msg)).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Handle incoming WebSocket messages
+        let mut receive_task = tokio::spawn(async move {
+            while let Some(Ok(msg)) = receiver.next().await {
                 match msg {
                     WsMessage::Text(text) => {
                         if let Ok(udp_msg) = serde_json::from_str(&text) {
-                            handle_message(udp_msg, addr, &socket, &clients).await;
+                            handle_message(udp_msg, addr, &socket_clone, &clients_clone).await;
                         }
                     }
-                    WsMessage::Binary(_) => {
-                        // 处理二进制消息如果需要
-                    }
-                    WsMessage::Close(_) => {
-                        break;
-                    }
+                    WsMessage::Close(_) => break,
                     _ => {}
                 }
             }
+        });
+
+        // Wait for either task to complete
+        tokio::select! {
+            _ = (&mut send_task) => receive_task.abort(),
+            _ = (&mut receive_task) => send_task.abort(),
         }
+
         println!("WebSocket 客户端已断开");
     })
 }
