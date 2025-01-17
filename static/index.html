@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Rust 服务器日志</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            font-family: monospace;
+            background: #1e1e1e;
+            color: #d4d4d4;
+        }
+        #log-container {
+            width: 100%;
+            height: calc(100vh - 40px);
+            overflow-y: auto;
+            background: #2d2d2d;
+            padding: 10px;
+            border-radius: 4px;
+        }
+        .log-entry {
+            margin: 5px 0;
+            padding: 5px;
+            border-bottom: 1px solid #3d3d3d;
+        }
+        .timestamp {
+            color: #569cd6;
+        }
+        .message {
+            color: #ce9178;
+            margin-left: 10px;
+        }
+        .error {
+            color: #f44336;
+        }
+    </style>
+</head>
+<body>
+    <div id="log-container"></div>
+    <script>
+        const logContainer = document.getElementById('log-container');
+        const ws = new WebSocket(`ws://${window.location.hostname}:3000/ws`);
+
+        ws.onmessage = (event) => {
+            const logEntry = document.createElement('div');
+            logEntry.className = 'log-entry';
+            
+            const data = JSON.parse(event.data);
+            logEntry.innerHTML = `
+                <span class="timestamp">[${new Date().toLocaleTimeString()}]</span>
+                <span class="message">${data.message}</span>
+            `;
+            
+            logContainer.appendChild(logEntry);
+            logContainer.scrollTop = logContainer.scrollHeight;
+        };
+
+        ws.onclose = () => {
+            const logEntry = document.createElement('div');
+            logEntry.className = 'log-entry';
+            logEntry.innerHTML = '<span class="error">WebSocket 连接已断开，请刷新页面重新连接</span>';
+            logContainer.appendChild(logEntry);
+        };
+    </script>
+</body>
+</html> 

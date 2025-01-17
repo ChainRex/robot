@@ -1,10 +1,19 @@
+use axum::{
+    extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
+    response::Response,
+    routing::get,
+    serve, Router,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
+use std::sync::mpsc;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
+use tokio::sync::broadcast;
 use tokio::sync::Mutex;
 use tokio::time::{self, Duration};
+use tower_http::services::ServeDir;
 
 // 定义消息类型
 #[derive(Serialize, Deserialize, Debug)]
@@ -71,14 +80,41 @@ enum Command {
     Right,
 }
 
+#[derive(Clone, Debug)]
+struct LogMessage {
+    message: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    // 绑定 UDP 服务器地址
-    let socket = Arc::new(UdpSocket::bind("0.0.0.0:8080").await?);
-    println!("服务器已启动，监听地址 0.0.0.0:8080");
+    // Create a channel for log messages
+    let (log_tx, log_rx) = mpsc::channel::<LogMessage>();
+    let log_tx = Arc::new(Mutex::new(log_tx));
 
-    // 使用 Arc 和 Mutex 来共享客户端信息
-    let clients = Arc::new(Mutex::new(ClientManager::new()));
+    // Create the UDP socket and start the UDP server
+    let socket = Arc::new(UdpSocket::bind("0.0.0.0:8080").await?);
+    println!("UDP服务器已启动，监听地址 0.0.0.0:8080");
+
+    let (broadcast_tx, _) = broadcast::channel::<String>(100);
+    let broadcast_tx = Arc::new(broadcast_tx);
+
+    let mut client_manager = ClientManager::new();
+    client_manager.broadcast_tx = Some(broadcast_tx.clone());
+    let clients = Arc::new(Mutex::new(client_manager));
+
+    // Start the web server
+    let app = Router::new()
+        .nest_service("/", ServeDir::new("static"))
+        .route("/ws", get(move |ws| ws_handler(ws, broadcast_tx.clone())));
+
+    let log_tx_clone = log_tx.clone();
+    println!("Web服务器已启动，访问 http://localhost:3000");
+
+    // Start the web server
+    tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+        serve(listener, app).await.unwrap();
+    });
 
     // 复制 Arc<UdpSocket> 而不是直接复制 UdpSocket
     let socket_clone = Arc::clone(&socket);
@@ -129,7 +165,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 struct ClientManager {
     control_clients: HashMap<String, std::net::SocketAddr>,
     robot_clients: HashMap<String, std::net::SocketAddr>,
-    last_heartbeat: HashMap<(ClientType, String), u64>, // (类型, ID) -> 时间戳
+    last_heartbeat: HashMap<(ClientType, String), u64>,
+    broadcast_tx: Option<Arc<broadcast::Sender<String>>>,
 }
 
 impl ClientManager {
@@ -138,21 +175,40 @@ impl ClientManager {
             control_clients: HashMap::new(),
             robot_clients: HashMap::new(),
             last_heartbeat: HashMap::new(),
+            broadcast_tx: None,
         }
     }
 
-    fn register(&mut self, client_type: ClientType, client_id: String, addr: std::net::SocketAddr) {
+    async fn send_log(&self, msg: String) {
+        println!("{}", msg);
+        if let Some(tx) = &self.broadcast_tx {
+            let _ = tx.send(
+                serde_json::json!({
+                    "message": msg
+                })
+                .to_string(),
+            );
+        }
+    }
+
+    async fn register(
+        &mut self,
+        client_type: ClientType,
+        client_id: String,
+        addr: std::net::SocketAddr,
+    ) {
         match client_type {
             ClientType::Control => {
                 self.control_clients.insert(client_id.clone(), addr);
-                println!("注册控制端: ID = {}, 地址 = {}", client_id, addr);
+                self.send_log(format!("注册控制端: ID = {}, 地址 = {}", client_id, addr))
+                    .await;
             }
             ClientType::Robot => {
                 self.robot_clients.insert(client_id.clone(), addr);
-                println!("注册机器人端: ID = {}, 地址 = {}", client_id, addr);
+                self.send_log(format!("注册机器人端: ID = {}, 地址 = {}", client_id, addr))
+                    .await;
             }
         }
-        // 更新心跳时间
         self.last_heartbeat
             .insert((client_type, client_id), current_timestamp());
     }
@@ -161,10 +217,10 @@ impl ClientManager {
         let client_id_clone = client_id.clone();
         self.last_heartbeat
             .insert((client_type, client_id), timestamp);
-        println!(
+        self.send_log(format!(
             "收到心跳: 类型 = {:?}, ID = {}, 时间戳 = {}",
             client_type, client_id_clone, timestamp
-        );
+        ));
     }
 
     fn get_robot_clients(&self) -> Vec<std::net::SocketAddr> {
@@ -176,7 +232,7 @@ impl ClientManager {
     }
 
     fn cleanup(&mut self) {
-        let threshold = current_timestamp() - 60; // 60 秒超时
+        let threshold = current_timestamp() - 60;
         let keys: Vec<_> = self
             .last_heartbeat
             .iter()
@@ -189,12 +245,12 @@ impl ClientManager {
             match client_type {
                 ClientType::Control => {
                     if let Some(addr) = self.control_clients.remove(&client_id) {
-                        println!("控制端超时: ID = {}, 地址 = {}", client_id, addr);
+                        self.send_log(format!("控制端超时: ID = {}, 地址 = {}", client_id, addr));
                     }
                 }
                 ClientType::Robot => {
                     if let Some(addr) = self.robot_clients.remove(&client_id) {
-                        println!("机器人端超时: ID = {}, 地址 = {}", client_id, addr);
+                        self.send_log(format!("机器人端超时: ID = {}, 地址 = {}", client_id, addr));
                     }
                 }
             }
@@ -209,64 +265,75 @@ async fn handle_message(
     socket: &Arc<UdpSocket>,
     clients: &Arc<Mutex<ClientManager>>,
 ) {
+    let mut clients_guard = clients.lock().await;
     match msg {
         Message::Register(data) => {
             let client_type = data.client_type;
             let client_id = data.client_id;
-            let mut clients = clients.lock().await;
-            clients.register(client_type, client_id, addr);
+            clients_guard.register(client_type, client_id, addr).await;
         }
         Message::ControlCommand(data) => {
-            println!(
-                "收到控制指令: {:?}, 时间戳 = {}",
-                data.command, data.timestamp
-            );
+            clients_guard
+                .send_log(format!(
+                    "收到控制指令: {:?}, 时间戳 = {}",
+                    data.command, data.timestamp
+                ))
+                .await;
             let serialized = serde_json::to_vec(&Message::ControlCommand(data)).unwrap();
-            let clients = clients.lock().await;
-            let robot_clients = clients.get_robot_clients();
+            let robot_clients = clients_guard.get_robot_clients();
             for robot_addr in robot_clients {
                 if let Err(e) = socket.send_to(&serialized, robot_addr).await {
-                    eprintln!("转发控制指令到 {} 失败: {}", robot_addr, e);
+                    clients_guard
+                        .send_log(format!("转发控制指令到 {} 失败: {}", robot_addr, e))
+                        .await;
                 } else {
-                    println!("转发控制指令到 {}", robot_addr);
+                    clients_guard
+                        .send_log(format!("转发控制指令到 {}", robot_addr))
+                        .await;
                 }
             }
         }
         Message::ImageData(data) => {
-            println!("收到图像数据, 时间戳 = {}", data.timestamp);
+            clients_guard
+                .send_log(format!("收到图像数据, 时间戳 = {}", data.timestamp))
+                .await;
             let serialized = serde_json::to_vec(&Message::ImageData(data)).unwrap();
-            let clients = clients.lock().await;
-            let control_clients = clients.get_control_clients();
+            let control_clients = clients_guard.get_control_clients();
             for control_addr in control_clients {
                 if let Err(e) = socket.send_to(&serialized, control_addr).await {
-                    eprintln!("转发图像数据到 {} 失败: {}", control_addr, e);
+                    clients_guard
+                        .send_log(format!("转发图像数据到 {} 失败: {}", control_addr, e))
+                        .await;
                 } else {
-                    println!("转发图像数据到 {}", control_addr);
+                    clients_guard
+                        .send_log(format!("转发图像数据到 {}", control_addr))
+                        .await;
                 }
             }
         }
         Message::ImageFragment(data) => {
-            println!(
-                "收到图像分片: {}/{}, 时间戳 = {}",
-                data.sequence, data.total, data.timestamp
-            );
+            clients_guard
+                .send_log(format!(
+                    "收到图像分片: {}/{}, 时间戳 = {}",
+                    data.sequence, data.total, data.timestamp
+                ))
+                .await;
             let serialized = serde_json::to_vec(&Message::ImageFragment(data)).unwrap();
-            let clients = clients.lock().await;
-            let control_clients = clients.get_control_clients();
+            let control_clients = clients_guard.get_control_clients();
             for control_addr in control_clients {
                 if let Err(e) = socket.send_to(&serialized, control_addr).await {
-                    eprintln!("转发图像分片到 {} 失败: {}", control_addr, e);
+                    clients_guard
+                        .send_log(format!("转发图像分片到 {} 失败: {}", control_addr, e))
+                        .await;
                 } else {
-                    println!("转发图像分片到 {}", control_addr);
+                    clients_guard
+                        .send_log(format!("转发图像分片到 {}", control_addr))
+                        .await;
                 }
             }
         }
         Message::Heartbeat(data) => {
-            let client_type = data.client_type;
-            let client_id = data.client_id;
-            let timestamp = data.timestamp;
-            let mut clients = clients.lock().await;
-            clients.update_heartbeat(client_type, client_id, timestamp);
+            clients_guard.update_heartbeat(data.client_type, data.client_id, data.timestamp);
         }
     }
 }
@@ -278,4 +345,22 @@ fn current_timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs()
+}
+
+// Add this new function for handling WebSocket connections
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    broadcast_tx: Arc<broadcast::Sender<String>>,
+) -> Response {
+    ws.on_upgrade(move |socket| handle_socket(socket, broadcast_tx))
+}
+
+async fn handle_socket(mut socket: WebSocket, broadcast_tx: Arc<broadcast::Sender<String>>) {
+    let mut rx = broadcast_tx.subscribe();
+
+    while let Ok(msg) = rx.recv().await {
+        if socket.send(WsMessage::Text(msg)).await.is_err() {
+            break;
+        }
+    }
 }
